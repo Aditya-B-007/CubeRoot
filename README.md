@@ -1,2 +1,2 @@
 # CubeRoot
-A compiler written in Rust that checks for mathematical faults in your single script.
+A compiler and virtual machine written in Rust for converting english code to binary code.
