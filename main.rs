@@ -1,68 +1,161 @@
-//================ Syntax matcher (Regex)============================
-
 use regex::Regex;
 
-#[derive(Debug, PartialEq)]
-pub enum ParsedCommand {
-    CreateArray { name: String },
-    AddElement { expr: MathExpr, array_name: String }, // Swapped i32 for MathExpr
-    DeleteElement { index: usize, array_name: String },
-}//---> This is the output that comes from the function below.
+//================ Syntax Matcher (Regex Frontend) ============================
+#[derive(Debug, Clone, PartialEq)]
+pub enum MathExpr {
+    Literal(i64),
+    Binary { op: char, left: Box<MathExpr>, right: Box<MathExpr> },
+    // Expandable math nodes go here
+}
 
-pub fn match_and_extract_flexible(input: &str) -> ParsedCommand {
-    let intent_create = Regex::new(r"(?i)\b(cr[ea]{1,2}t[e]?|make|new|init|generate)\b").unwrap();
-    let intent_add    = Regex::new(r"(?i)\b(a[d]{1,2}|push|insert|append|put|place)\b").unwrap();
-    let intent_delete = Regex::new(r"(?i)\b(d[el]{1,3}t[e]?|remove|drop|clear|pop|erase)\b").unwrap();
-    let entity_number = Regex::new(r"\b\d+\b").unwrap();
-    let entity_name   = Regex::new(r"\b[a-zA-Z_]\w*\b").unwrap();
-    let reserved_keywords = vec![
-        "create", "creete", "make", "new", "init", "generate",
-        "add", "push", "insert", "append", "put", "place",
-        "delete", "delte", "remove", "drop", "clear", "pop", "erase",
-        "array", "aray", "list", "index", "idx", "ind", "from", "form", "to", "into"
-    ];
-    if intent_create.is_match(input) {
-        let name = entity_name.find_iter(input)
-            .map(|m| m.as_str().to_string())
-            .find(|w| !reserved_keywords.contains(&w.to_lowercase().as_str()))
-            .expect("LLM-Parser Error: Could not determine your target array name.");
+#[derive(Debug, Clone, PartialEq)]
+pub enum SemanticObject {
+    // Action Verbs
+    ActionCreate,
+    ActionAdd,
+    ActionDelete,
+    ActionUpdate,
+    
+    // Connectors / Prepositions
+    ConnectorTo,
+    ConnectorFrom,
+    ConnectorAt,
+    
+    // Abstract Wrapped Primitives
+    Identifier(String),
+    NumericValue(usize), 
+    Expression(MathExpr),
+    
+    // Structural Data Types (For your extension requirement)
+    TargetTypeArray,
+    TargetTypeMap,
+    TargetTypeStack,
+    //Pratt terms
+    Plus,
+    Minus,
+    Multiply,
+    Divide,
+    LeftParen,
+    RightParen,
+    EOF,
+}
 
-        ParsedCommand::CreateArray { name }
+pub struct SemanticLexer;
 
-    } else if intent_add.is_match(input) {
-	let array_name = entity_name.find_iter(input)
-	    .map(|m| m.as_str().to_string())
-	    .find(|w| !reserved_keywords.contains(&w.to_lowercase().as_str()))
-	    .expect("LLM-Parser Error: Missing destination array identifier.");
-	let clean_math_target = input.replace(&array_name, "");
-	let math_tokens = tokenize_math(&clean_math_target); 
-	let mut parser = PrattParser::new(math_tokens);
-	let expr = parser.parse_expression(0);
-
-	ParsedCommand::AddElement { expr, array_name }
-
-    } else if intent_delete.is_match(input) {
-        let idx_str = entity_number.find(input)
-            .expect("LLM-Parser Error: Missing structural target index for elimination.")
-            .as_str();
-        let index = idx_str.parse::<usize>().unwrap();
-
-        let array_name = entity_name.find_iter(input)
-            .map(|m| m.as_str().to_string())
-            .find(|w| !reserved_keywords.contains(&w.to_lowercase().as_str()))
-            .expect("LLM-Parser Error: Missing source array identifier.");
-
-        ParsedCommand::DeleteElement { index, array_name }
-
-    } else {
-        panic!("LLM-Parser Error: Could not figure out what you want to do with '{}'", input);
+impl SemanticLexer {
+    pub fn tokenize(input: &str) -> Vec<SemanticObject> {
+        let mut objects = Vec![];
+        let re_word = Regex::new(r"[a-zA-Z_]\w*|\d+|[+\-*/]").unwrap();
+        
+        for mat in re_word.find_iter(input) {
+            let txt = mat.as_str();
+            let lower = txt.to_lowercase();
+            
+            let obj = match lower.as_str() {
+                // Map actions
+                "create" | "make" | "new" | "init" => SemanticObject::ActionCreate,
+                "add" | "push" | "insert" | "append" => SemanticObject::ActionAdd,
+                "delete" | "remove" | "drop" | "erase" => SemanticObject::ActionDelete,
+                "update" | "set" | "change" => SemanticObject::ActionUpdate,
+                
+                // Map connectors
+                "to" | "into" | "in" => SemanticObject::ConnectorTo,
+                "from" | "out" => SemanticObject::ConnectorFrom,
+                "at" | "on" | "index" | "key" => SemanticObject::ConnectorAt,
+                
+                // Map future structure targets
+                "array" | "list" | "vector" => SemanticObject::TargetTypeArray,
+                "map" | "dictionary" | "dict" => SemanticObject::TargetTypeMap,
+                "stack" => SemanticObject::TargetTypeStack,
+                
+                // Map primitives wrapped inside semantic objects
+                _ if txt.chars().next().unwrap().is_ascii_digit() => {
+                    SemanticObject::NumericValue(txt.parse().unwrap())
+                }
+                _ => SemanticObject::Identifier(txt.to_string()),
+            };
+            objects.push(obj);
+        }
+        objects
     }
 }
 
 
-//=================================================================
+pub enum ExpandedCommand {
+    Create { data_type: SemanticObject, name: String },
+    Insert { payload: SemanticObject, target: String, key_or_idx: Option<SemanticObject> },
+    Remove { target: String, key_or_idx: SemanticObject },
+}
 
-//==================Abstract syntax tree==========================
+pub fn match_and_extract_flexible(input: &str) -> ASTStatement {
+    let tokens = tokenize_unified(input);
+    if tokens.is_empty() || tokens[0] == SemanticObject::EOF {
+        panic!("Syntax Error: Received empty expression line string.");
+    }
+
+    match &tokens[0] {
+        SemanticObject::ActionCreate => {
+            // Expression: "Create my_array"
+            let name = tokens.iter()
+                .find_map(|t| if let SemanticObject::Identifier(id) = t { Some(id.clone()) } else { None })
+                .expect("Parser Error: Missing target identifier name string for array initialization.");
+
+            ASTStatement::CreateArray { name }
+        }
+
+        SemanticObject::ActionAdd => {
+            // Expression: "Add 5 * (10 + 2) into user_list"
+            let to_index = tokens.iter().position(|t| matches!(t, SemanticObject::ConnectorTo))
+                .expect("Syntax Error: Missing structural vector directional destination keyword ('to' / 'into').");
+            
+            let array_name = match tokens.get(to_index + 1) {
+                Some(SemanticObject::Identifier(name)) => name.clone(),
+                _ => panic!("Syntax Error: Token directly following 'to' connector must be a valid destination identifier.")
+            };
+
+            // Slice out only the math symbols: sitting between "Add" and "into"
+            let mut math_tokens = tokens[1..to_index].to_vec();
+            math_tokens.push(SemanticObject::EOF); // Ensure Pratt parser has an EOF marker safely appended
+
+            let mut pratt = PrattParser::new(math_tokens);
+            let expr = pratt.parse_expression(0);
+
+            ASTStatement::AddToArray { expr, array_name }
+        }
+
+        SemanticObject::ActionDelete => {
+            // Expression: "Delete index 4 from user_list"
+            let index = tokens.iter()
+                .find_map(|t| if let SemanticObject::Number(num) = t { Some(*num as usize) } else { None })
+                .expect("Syntax Error: Missing numerical lookup array target index for deletion operations.");
+
+            let array_name = tokens.iter()
+                .skip_while(|t| !matches!(t, SemanticObject::ConnectorFrom))
+                .nth(1)
+                .and_then(|t| if let SemanticObject::Identifier(id) = t { Some(id.clone()) } else { None })
+                .expect("Syntax Error: Missing targeted source array identifier after 'from' keyword.");
+
+            ASTStatement::DeleteFromArray { index, array_name }
+        }
+
+        // If the line doesn't start with an action keyword, fall back to parsing it as pure math code
+        _ => {
+            let mut pratt = PrattParser::new(tokens.clone());
+            ASTStatement::EvaluateMath(pratt.parse_expression(0))
+        }
+    }
+}
+
+
+// Simple internal helper method for the enum
+impl SemanticObject {
+    fn is_identifier_equal(&self, text: &str) -> bool {
+        if let SemanticObject::Identifier(id) = self { id == text } else { false }
+    }
+}
+
+
+//================== Abstract Syntax Tree & Lexer ==========================
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum MathOpType {
@@ -71,15 +164,7 @@ pub enum MathOpType {
     Multiply,
     Divide,
 }
-#[derive(Debug, Clone, PartialEq)]
-pub enum Token {
-    Number(i32),
-    Plus,
-    Minus,
-    Multiply,
-    Divide,
-    EOF,
-}
+
 #[derive(Debug, PartialEq, Clone)]
 pub enum MathExpr {
     Number(i32),
@@ -92,86 +177,104 @@ pub enum MathExpr {
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum ASTStatement {
-    CreateArray { 
-        name: String 
-    },
-    AddToArray { 
-        expr: MathExpr, 
-        array_name: String 
-    },
-    DeleteFromArray { 
-        index: usize, 
-        array_name: String 
-    },
+    CreateArray { name: String },
+    AddToArray { expr: MathExpr, array_name: String },
+    DeleteFromArray { index: usize, array_name: String },
     EvaluateMath(MathExpr),
 }
 
-pub fn tokenize_math(input: &str) -> Vec<Token> {
+pub fn tokenize_unified(input: &str) -> Vec<SemanticObject> {
     let mut tokens = Vec::new();
-    let mut chars = input.chars().peekable();
-
-    while let Some(&ch) = chars.peek() {
-        match ch {
-            ' ' | '\t' | '\r' | '\n' => { chars.next(); } // Skip whitespace
-            '+' => { tokens.push(Token::Plus); chars.next(); }
-            '-' => { tokens.push(Token::Minus); chars.next(); }
-            '*' => { tokens.push(Token::Multiply); chars.next(); }
-            '/' => { tokens.push(Token::Divide); chars.next(); }
-            '0'..='9' => {
-                let mut num_str = String::new();
-                while let Some(&digit) = chars.peek() {
-                    if digit.is_ascii_digit() {
-                        num_str.push(chars.next().unwrap());
-                    } else {
-                        break;
-                    }
-                }
-                tokens.push(Token::Number(num_str.parse::<i32>().unwrap()));
+    // This splits words, digits, and mathematical operator symbols
+    let re_word = Regex::new(r"[a-zA-Z_]\w*|\d+|[+\-*/()]").unwrap();
+    
+    for mat in re_word.find_iter(input) {
+        let txt = mat.as_str();
+        let lower = txt.to_lowercase();
+        
+        let obj = match lower.as_str() {
+            // Step A: Map actions
+            "create" | "make" | "new" | "init" => SemanticObject::ActionCreate,
+            "add" | "push" | "insert" | "append" => SemanticObject::ActionAdd,
+            "delete" | "remove" | "drop" => SemanticObject::ActionDelete,
+            
+            // Step B: Map english text context anchors
+            "to" | "into" | "in" => SemanticObject::ConnectorTo,
+            "from" | "out" => SemanticObject::ConnectorFrom,
+            
+            // Step C: Map arithmetic operators
+            "+" => SemanticObject::Plus,
+            "-" => SemanticObject::Minus,
+            "*" => SemanticObject::Multiply,
+            "/" => SemanticObject::Divide,
+            "(" => SemanticObject::LeftParen,
+            ")" => SemanticObject::RightParen,
+            
+            // Step D: Parse primitives
+            _ if txt.chars().next().unwrap().is_ascii_digit() => {
+                SemanticObject::Number(txt.parse().unwrap())
             }
-            _ => { chars.next(); } // Ignore non-math characters (or handle gracefully)
-        }
+            _ => SemanticObject::Identifier(txt.to_string()),
+        };
+        tokens.push(obj);
     }
-    tokens.push(Token::EOF);
+    tokens.push(SemanticObject::EOF);
     tokens
 }
-//----------Pratt Parser--------------------
+
+
+//========================= Pratt Parser Engine ============================
 pub struct PrattParser {
-    tokens: Vec<Token>,
+    tokens: Vec<SemanticObject>,
     position: usize,
 }
 
 impl PrattParser {
-    pub fn new(tokens: Vec<Token>) -> Self {
+    pub fn new(tokens: Vec<SemanticObject>) -> Self {
         Self { tokens, position: 0 }
     }
 
-    fn peek(&self) -> &Token {
+    fn peek(&self) -> &SemanticObject {
         &self.tokens[self.position]
     }
 
-    fn advance(&mut self) -> Token {
+    fn advance(&mut self) -> SemanticObject {
         let tok = self.tokens[self.position].clone();
-        if tok != Token::EOF {
+        if tok != SemanticObject::EOF {
             self.position += 1;
         }
         tok
     }
 
-    fn get_binding_power(op: &Token) -> u8 {
+    fn get_binding_power(op: &SemanticObject) -> u8 {
         match op {
-            Token::Plus | Token::Minus => 10,
-            Token::Multiply | Token::Divide => 20,
+            SemanticObject::Plus | SemanticObject::Minus => 10,
+            SemanticObject::Multiply | SemanticObject::Divide => 20,
             _ => 0,
         }
     }
 
     pub fn parse_expression(&mut self, min_bp: u8) -> MathExpr {
         let token = self.advance();
+        
+        // --- NUD Phase (Null Denotation) ---
         let mut left = match token {
-            Token::Number(val) => MathExpr::Number(val),
-            unsupported => panic!("Parser Error: Expected a number, found {:?}", unsupported),
+            SemanticObject::Number(val) => MathExpr::Number(val),
+            
+            // Support for referencing variables inside expressions!
+            SemanticObject::Identifier(name) => MathExpr::Variable(name),
+            
+            SemanticObject::LeftParen => {
+                let inner_expr = self.parse_expression(0);
+                match self.advance() {
+                    SemanticObject::RightParen => inner_expr,
+                    other => panic!("Parser Error: Unmatched opening parenthesis. Found {:?}", other),
+                }
+            }
+            unsupported => panic!("Parser Error: Expected primary math expression, found {:?}", unsupported),
         };
 
+        // --- LED Phase (Left Denotation) ---
         loop {
             let next_op = self.peek();
             let bp = Self::get_binding_power(next_op);
@@ -182,10 +285,10 @@ impl PrattParser {
 
             let op_token = self.advance();
             let op_type = match op_token {
-                Token::Plus => MathOpType::Add,
-                Token::Minus => MathOpType::Subtract,
-                Token::Multiply => MathOpType::Multiply,
-                Token::Divide => MathOpType::Divide,
+                SemanticObject::Plus => MathOpType::Add,
+                SemanticObject::Minus => MathOpType::Subtract,
+                SemanticObject::Multiply => MathOpType::Multiply,
+                SemanticObject::Divide => MathOpType::Divide,
                 _ => unreachable!(),
             };
 
@@ -202,69 +305,8 @@ impl PrattParser {
     }
 }
 
-//=============================================================
 
-//==========Byte code serialization engine=====================
-
-pub struct BytecodeCompiler {
-    pub stream: Vec<u8>,
-}
-
-impl BytecodeCompiler {
-    pub fn new() -> Self {
-        Self { stream: Vec::new() }
-    }
-
-    pub fn compile_statement(&mut self, statement: ASTStatement) {
-        match statement {
-            ASTStatement::CreateArray { name } => {
-                self.stream.push(0x06); // Opcode
-                self.write_string(&name);
-            }
-            ASTStatement::AddToArray { expr, array_name } => {
-                self.compile_expression(expr);
-                self.stream.push(0x07); // Opcode
-                self.write_string(&array_name);
-            }
-            ASTStatement::DeleteFromArray { index, array_name } => {
-                self.stream.push(0x08); // Opcode
-                self.stream.extend_from_slice(&(index as u64).to_be_bytes());
-                self.write_string(&array_name);
-            }
-            ASTStatement::EvaluateMath(expr) => {
-                self.compile_expression(expr);
-            }
-        }
-    }
-
-    fn compile_expression(&mut self, expr: MathExpr) {
-        match expr {
-            MathExpr::Number(val) => {
-                self.stream.push(0x01); // OpPush Opcode
-                self.stream.extend_from_slice(&val.to_be_bytes()); // 4-byte payload
-            }
-            MathExpr::BinaryOp { op, left, right } => {
-                self.compile_expression(*left);
-                self.compile_expression(*right);
-                
-                let opcode = match op {
-                    MathOpType::Add => 0x02,
-                    MathOpType::Subtract => 0x03,
-                    MathOpType::Multiply => 0x04,
-                    MathOpType::Divide => 0x05,
-                };
-                self.stream.push(opcode);
-            }
-        }
-    }
-
-    fn write_string(&mut self, s: &str) {
-        let bytes = s.as_bytes();
-        let length = bytes.len() as u32; 
-        self.stream.extend_from_slice(&length.to_be_bytes()); 
-        self.stream.extend_from_slice(bytes); 
-    }
-}
+//=================== Data Transformation Binding Layer =======================
 
 impl From<ParsedCommand> for ASTStatement {
     fn from(command: ParsedCommand) -> Self {
@@ -281,128 +323,73 @@ impl From<ParsedCommand> for ASTStatement {
         }
     }
 }
-//=================================================================
 
-//============ Virtual Machine ===================================
+//================== LLVM IR SSA Compilation Backend =====================
 
-//============ Virtual Machine ===================================
-
-use std::collections::HashMap;
-
-pub struct VirtualMachine {
-    stack: Vec<i32>,
-    heap: HashMap<String, Vec<i32>>,
+pub struct LlvmIrCompiler {
+    pub register_counter: usize,
 }
 
-impl VirtualMachine {
+impl LlvmIrCompiler {
     pub fn new() -> Self {
-        Self {
-            stack: Vec::new(),
-            heap: HashMap::new(),
-        }
+        Self { register_counter: 0 }
     }
 
-    pub fn run(&mut self, bytecode: &[u8]) {
-        let mut pc = 0; // Program Counter pointer
-
-        while pc < bytecode.len() {
-            let opcode = bytecode[pc];
-            pc += 1;
-
-            match opcode {
-                0x01 => {
-                    if pc + 4 > bytecode.len() {
-                        panic!("VM Execution Error: Unexpected EOF reading OpPush payload.");
-                    }
-                    let val = i32::from_be_bytes(bytecode[pc..pc + 4].try_into().unwrap());
-                    pc += 4;
-                    self.stack.push(val);
-                }
-                0x02 => {
-                    let right = self.stack.pop().expect("VM Error: Math Stack Underflow during Addition.");
-                    let left = self.stack.pop().expect("VM Error: Math Stack Underflow during Addition.");
-                    self.stack.push(left + right);
-                }
-                0x03 => {
-                    let right = self.stack.pop().expect("VM Error: Math Stack Underflow during Subtraction.");
-                    let left = self.stack.pop().expect("VM Error: Math Stack Underflow during Subtraction.");
-                    self.stack.push(left - right);
-                }
-                0x04 => {
-                    let right = self.stack.pop().expect("VM Error: Math Stack Underflow during Multiplication.");
-                    let left = self.stack.pop().expect("VM Error: Math Stack Underflow during Multiplication.");
-                    self.stack.push(left * right);
-                }
-                0x05 => {
-                    let right = self.stack.pop().expect("VM Error: Math Stack Underflow during Division.");
-                    let left = self.stack.pop().expect("VM Error: Math Stack Underflow during Division.");
-                    if right == 0 {
-                        panic!("VM Runtime Panic: Division by zero exception encountered.");
-                    }
-                    self.stack.push(left / right);
-                }
-                0x06 => {
-                    let array_name = self.read_string_metadata(bytecode, &mut pc);
-                    self.heap.insert(array_name, Vec::new());
-                }
-                0x07 => {
-                    let array_name = self.read_string_metadata(bytecode, &mut pc);
-                    let val = self.stack.pop().expect("VM Error: Calculation stack empty; nothing to add to array.");
-                    
-                    let array_instance = self.heap.get_mut(&array_name)
-                        .expect("VM Runtime Panic: Target reference array not found on heap map.");
-                    array_instance.push(val);
-                }
-                0x08 => {
-                    if pc + 8 > bytecode.len() {
-                        panic!("VM Execution Error: Unexpected EOF reading OpDeleteFromArray index payload.");
-                    }
-                    let index = u64::from_be_bytes(bytecode[pc..pc + 8].try_into().unwrap()) as usize;
-                    pc += 8;
-
-                    let array_name = self.read_string_metadata(bytecode, &mut pc);
-                    let array_instance = self.heap.get_mut(&array_name)
-                        .expect("VM Runtime Panic: Target reference array not found on heap map.");
-                    
-                    if index >= array_instance.len() {
-                        panic!("VM Runtime Panic: Array index {} out of bounds for current size ({}).", index, array_instance.len());
-                    }
-                    array_instance.remove(index);
-                }
-
-                unsupported => {
-                    panic!("VM Fatal Error: Invalid or unrecognized Machine Opcode code raw byte '0x{:X?}' detected.", unsupported);
-                }
+    fn next_register(&mut self) -> String {
+        self.register_counter += 1;
+        format!("%t{}", self.register_counter)
+    }
+    pub fn compile_statement(&mut self, statement: ASTStatement) -> String {
+        match statement {
+            ASTStatement::CreateArray { name } => {
+                // In a true LLVM system context, dynamic data structures represent global heap allocations.
+                // We'll declare a comment and a standard basic tracking metadata variable link.
+                format!("; --- Structural Mapping: Declaring Memory Instance '{}' ---\n", name)
+            }
+            ASTStatement::AddToArray { expr, array_name } => {
+                let mut stream = format!("; --- Structural Mapping: Appending Calculation to List '{}' ---\n", array_name);
+                let (expr_ir, final_reg) = self.compile_expression(expr);
+                stream.push_str(&expr_ir);
+                stream.push_str(&format!("; Target output sequence is resolved in register {}\n", final_reg));
+                stream
+            }
+            ASTStatement::DeleteFromArray { index, array_name } => {
+                format!("; --- Structural Mapping: Erasing Index Pointer ({}) from collection '{}' ---\n", index, array_name)
+            }
+            ASTStatement::EvaluateMath(expr) => {
+                let (expr_ir, _) = self.compile_expression(expr);
+                expr_ir
             }
         }
     }
-    fn read_string_metadata(&self, bytecode: &[u8], pc: &mut usize) -> String {
-        if *pc + 4 > bytecode.len() {
-            panic!("VM Execution Error: Unexpected EOF while fetching string size prefix bytes.");
-        }
-        let length = u32::from_be_bytes(bytecode[*pc..*pc + 4].try_into().unwrap()) as usize;
-        *pc += 4;
 
-        if *pc + length > bytecode.len() {
-            panic!("VM Execution Error: Unexpected EOF while fetching string characters.");
-        }
-        let string_bytes = &bytecode[*pc..*pc + length];
-        *pc += length;
+    /// Compiles algebraic trees into linear static single assignment (SSA) registers
+    pub fn compile_expression(&mut self, expr: MathExpr) -> (String, String) {
+        match expr {
+            MathExpr::Number(val) => {
+                // Literals do not require an active assembly pipeline instruction line
+                (String::new(), val.to_string())
+            }
+            MathExpr::BinaryOp { op, left, right } => {
+                let (left_code, left_target) = self.compile_expression(*left);
+                let (right_code, right_target) = self.compile_expression(*right);
 
-        String::from_utf8(string_bytes.to_vec())
-            .expect("VM Execution Error: Failed parsing identifier name into dynamic UTF-8 string layout.")
-    }
-    pub fn print_state(&self) {
-        println!("Working Evaluation Stack: {:?}", self.stack);
-        println!("Heap Arrays Status:");
-        for (name, contents) in &self.heap {
-            println!("  -> Array '{}': {:?}", name, contents);
+                let my_register = self.next_register();
+                let llvm_op = match op {
+                    MathOpType::Add => "add",
+                    MathOpType::Subtract => "sub",
+                    MathOpType::Multiply => "mul",
+                    MathOpType::Divide => "sdiv",
+                };
+
+                let my_instruction = format!(
+                    "    {} = {} i32 {}, {}\n",
+                    my_register, llvm_op, left_target, right_target
+                );
+
+                let total_accumulated_code = format!("{}{}{}", left_code, right_code, my_instruction);
+                (total_accumulated_code, my_register)
+            }
         }
     }
 }
-//==========================================================
-
-
-
-
-
